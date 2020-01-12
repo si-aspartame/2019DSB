@@ -1,0 +1,66 @@
+#%%
+#・event_idは、あるユーザのあるゲームに対して一つ割り当てられる。
+#  一度閉じてもevent_idは変更されない、game_sessionは変更される。
+#・game_sessionは、ゲームの種別ごとの、毎回のプレイ(開いてから閉じるまで)に与えられるIDであり
+#  一度閉じると同じユーザであっても変更される。
+#・timestampはtimestampだがstring型なので変換が必要
+#・event_dataは謎のjson
+#・installation_idでユーザを区別している。
+#・event_countはevent_dataから抽出されるゲームセッション内の増加値で、1が引かれている。
+#・event_codeはそれぞれのtitleで固有のイベントの種類だが、2000は常にゲームスタートを表す。
+#・game_timeはゲーム開始からの秒数(ms)
+#・titleはゲームタイトル
+#・typeはゲームまたはビデオのタイプ
+#  'Game', 'Assessment(評価)', 'Activity(活動？)', 'Clip(ビデオクリップ？)'
+#・worldはゲームやビデオが属するセクション、 
+#  'NONE' (at the app's start screen), TREETOPCITY' (Length/Height),
+#  'MAGMAPEAK' (Capacity/Displacement), 'CRYSTALCAVES' (Weight)
+
+# それぞれのinstallation_idの最後のAssesment群について、
+# そのAssesmentが
+# 3:最初のトライでtrue
+# 2:二回目のトライでtrue
+# 1:三回目以降のトライでtrue
+# 0:正解できなかった
+# を最終的に予測する
+# そのためには最後のAssesmentの最終トライでcorrectがtrueかどうかを確認(num_correct)し
+# その後、そのAssessment群でいくつ不正解したかを確認(num_incorrect)する。
+# そこから最終的なAccuracy_groupを算出する
+
+# Bird MeasurerのAssessmentは二段階で、4100のあとに4110が続く。この場合予測するのは4110の方。
+# 他は4100一回のみ
+
+#Assessmentとそれ以外で指標を分ける
+
+#全部横に並べて入れるか、最終try以前のデータから作った特徴量を付加した1行で予測をするか
+#installation_idごとの最後のAssessment群
+#今までのAssessmentのTrue回数
+
+#testデータのそれぞれのinstallation_idの最後のトランザクションは常に2000でAssessmentが始まる
+#その結果を予測する
+
+#その子供が最後の2000で始まるAssessmentで良い結果を残すにはどういう条件が必要か
+
+#過去に同じAssessmentをプレイしている 0, 1
+#過去に同じAssessmentでtrueである 0, 1
+#今までのtransaction数
+#今までのAssessmentのプレイ回数(gamessessionのうちAssessmentをカウント)
+
+#これまでのトランザクションのタイムスタンプ間の差の中央値＝速度
+
+#gamesessionで区切ると、閉じて再起動してすぐプレイしたときにバグる
+#以前のもの全てで入れるしかない
+#%%
+##############################################################################
+#先のgame_sessionを計算対象に含む特徴量からリークしてる
+#→installation_idでグルーピングするものは全てその行より手前のデータから作る必要がある
+##############################################################################
+#0123の予測の順番（今は0321）
+#1を予測するのが難しい、「失敗しまくるが最後に成功する子供」はどういうやつか考える必要がある
+#→あるいは逆に、失敗しまくるし最後はやめてしまう子供を考える
+#過去のAssessmentの成功/失敗率を入れるとか
+#それ以前のgamesessionについての特徴を追加すべきか
+#3と2以外を使ってcorrectがtrueかfalseかの二種の分類にする→ラベルないとむずくね
+#まず[2,3]か[0,1]かの分類をし、次にまた分類をする（有力！明日やる）
+#現状0を3と解答してる確率が高い
+#installation_idの特徴を加えるときは最後のgamesessionのAssessmentは全て落とす(testが最後のAssessmentの開始で終わるため)

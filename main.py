@@ -4,18 +4,14 @@
 from IPython import get_ipython
 import numpy as np
 import pandas as pd
-# pd.set_option('display.max_columns', 1000)
-from tqdm import tqdm_notebook as tqdm
-from collections import Counter
-from scipy import stats
+from tqdm import tqdm
 import lightgbm as lgb
-# from sklearn.metrics import cohen_kappa_score
-from sklearn.model_selection import GroupKFold, KFold
+from sklearn.model_selection import StratifiedKFold
 import gc
-import json
 from sklearn import metrics
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, minmax_scale
 from bayes_opt import BayesianOptimization
+from sklearn.metrics import cohen_kappa_score
 
 %matplotlib inline
 
@@ -27,85 +23,162 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-#%%
-#・event_idは、あるユーザのあるゲームに対して一つ割り当てられる。
-#  一度閉じてもevent_idは変更されない、game_sessionは変更される。
-#・game_sessionは、ゲームの種別ごとの、毎回のプレイ(開いてから閉じるまで)に与えられるIDであり
-#  一度閉じると同じユーザであっても変更される。
-#・timestampはtimestampだがstring型なので変換が必要
-#・event_dataは謎のjson
-#・installation_idでユーザを区別している。
-#・event_countはevent_dataから抽出されるゲームセッション内の増加値で、1が引かれている。
-#・event_codeはそれぞれのtitleで固有のイベントの種類だが、2000は常にゲームスタートを表す。
-#・game_timeはゲーム開始からの秒数(ms)
-#・titleはゲームタイトル
-#・typeはゲームまたはビデオのタイプ
-#  'Game', 'Assessment(評価)', 'Activity(活動？)', 'Clip(ビデオクリップ？)'
-#・worldはゲームやビデオが属するセクション、 
-#  'NONE' (at the app's start screen), TREETOPCITY' (Length/Height),
-#  'MAGMAPEAK' (Capacity/Displacement), 'CRYSTALCAVES' (Weight)
-
-# それぞれのinstallation_idの最後のAssesment群について、
-# そのAssesmentが
-# 3:最初のトライでtrue
-# 2:二回目のトライでtrue
-# 1:三回目以降のトライでtrue
-# 0:正解できなかった
-# を最終的に予測する
-# そのためには最後のAssesmentの最終トライでcorrectがtrueかどうかを確認(num_correct)し
-# その後、そのAssessment群でいくつ不正解したかを確認(num_incorrect)する。
-# そこから最終的なAccuracy_groupを算出する
-
-# Bird MeasurerのAssessmentは二段階で、4100のあとに4110が続く。この場合予測するのは4110の方。
-# 他は4100一回のみ
-
-#Assessmentとそれ以外で指標を分ける
-
-#全部横に並べて入れるか、最終try以前のデータから作った特徴量を付加した1行で予測をするか
-#installation_idごとの最後のAssessment群
-#今までのAssessmentのTrue回数
-
-#testデータのそれぞれのinstallation_idの最後のトランザクションは常に2000でAssessmentが始まる
-#その結果を予測する
-
-#その子供が最後の2000で始まるAssessmentで良い結果を残すにはどういう条件が必要か
-
-#過去に同じAssessmentをプレイしている、またその結果
-#今までのAssessmentのプレイ回数
-#時間をかけてやっている、かけずにやっている
-#clipはスキップ可能か？可能ならスキップしているか
-
 # %%
-print('Loading')
-train_df = pd.read_csv('./input/train.csv')
-test_df = pd.read_csv('./input/test.csv')
-# train_labels_df = pd.read_csv('./input/train_labels.csv')
-# sample_submission = pd.read_csv('./input/sample_submission.csv')
+path = './input/'
+print('Loading...')
+train = pd.read_csv(f'{path}train.csv')
+test = pd.read_csv(f'{path}test.csv')
+labels = pd.read_csv(f'{path}train_labels.csv')
 
+#%%
+# train_df[(train_df['event_code']==4100) & (train_df['type'] == 'Assessment')]
+dropping_in_data=[
+    'installation_id','game_session', 'event_id', 'squeeze_target', \
+    'type', 'event_code', 'event_data', 'timestamp', 'date', \
+    'game_time', 'event_count', 'game_session|installation_id', 'world',\
+    'title|installation_id']
+#correctとincorrectを予測したほうがいいかも
+dropping_in_labels=['game_session','installation_id','title','num_correct','num_incorrect', 'accuracy']
+print(train.dtypes)
+print(dropping_in_data)
+print(dropping_in_labels)
+
+#%%
+train, test = transform(train, test)
+
+#%%
+train = data_squeeze(train,mode='train')
+
+#%%
+labels = pd.read_csv('./input/train_labels.csv')
+labels['game_session|installation_id'] = labels['game_session'] +'|'+ labels['installation_id']
+labels = labels.drop(columns=dropping_in_labels, axis=1)
+
+#%%
+train = pd.merge(train, labels, on='game_session|installation_id')
+train = train.drop(columns=dropping_in_data, axis=1)
+del labels
+gc.collect()
 
 #%%
 
+test = data_squeeze(test, mode='test')
+test = test.drop(columns=dropping_in_data, axis=1)
 
 #%%
-print(train_df.shape)
-new_train_df, new_test_df = transform(train_df, test_df)
-print(train_df.shape)
+train = reduce_mem_usage(train)
+test = reduce_mem_usage(test)
 
 #%%
-train_df.info()
+print(train.columns)
+print(test.columns)
 
 #%%
-if train_df['event_id'].all() == new_train_df['event_id'].all():
-    print('OKです。')
+train.head()
 #%%
-display(train_df[train_df['event_data'].str.contains('"correct":true', na=False)].query("type=='Assessment' & event_code==4100"))
+categoricals = ['title', 'hour', 'weekday', 'exp_assess', 'installation_id->hour.mean']
+def bo_run_lgb(n_estimators, subsample, learning_rate, feature_fraction, train=train, test=test):
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    target = train['accuracy_group']
+    train = train.drop(['accuracy_group'], axis=1)
+    oof_pred = np.zeros((len(train)))
+    y_pred = np.zeros((len(test)))
+    for fold, (tr_ind, val_ind) in enumerate(kf.split(train, target)):
+        #print('Fold {}'.format(fold + 1))
+        x_train, x_val = train.loc[tr_ind], train.loc[val_ind]
+        y_train, y_val = target.loc[tr_ind], target.loc[val_ind]
+        train_set = lgb.Dataset(x_train, y_train, categorical_feature=categoricals)
+        val_set = lgb.Dataset(x_val, y_val, categorical_feature=categoricals)
+
+        params = {
+            'n_estimators':int(n_estimators),
+            'boosting_type': 'gbdt',
+            'objective': 'regression',
+            'metric': 'rmse',
+            'subsample': subsample,
+            'subsample_freq': 1,
+            'learning_rate': learning_rate,
+            'feature_fraction': feature_fraction,
+            'lambda_l1': 1,
+            'lambda_l2': 1,
+            'early_stopping_rounds': 100,
+            'verbose': -1
+            }
+
+        model = lgb.train(params, train_set, early_stopping_rounds = 50, valid_sets=[train_set, val_set], verbose_eval=False)
+        oof_pred[val_ind] = model.predict(x_val)
+        #print('Partial score of fold {} is: {}'.format(fold, eval_qwk_lgb_regr(y_val, oof_pred[val_ind])[1]))
+        y_pred += model.predict(test) / 5
+    loss_score = cohen_kappa_score(target, np.round(oof_pred), weights='quadratic')#trainのロス
+    result = pd.Series(np.argmax(oof_pred))
+    #print('Our oof cohen kappa score is: ', loss_score)
+    #print(result.value_counts(normalize = True))
+    return -(loss_score)#model, y_pred
 
 #%%
-display(train_df[train_df['type'] == 'Assessment']['title'].value_counts().index)
-train_df.info()
-
+pbounds = {
+    'n_estimators':(5000, 50000),
+    'subsample': (0.5, 0.9),
+    'learning_rate': (0.001, 0.01),
+    'feature_fraction': (0.5, 0.9),
+    }
+optimizer = BayesianOptimization(f=bo_run_lgb, pbounds=pbounds)
+optimizer.maximize(init_points=1, n_iter=1)
+max_param = optimizer.max['params']
+del model, optimizer
+gc.collect
 #%%
-display(train_df['installation_id'].value_counts())
-train_df['installation_id'].value_counts().hist(log=True)
+def final_run_lgb(train=train, test=test, max_param=optimizer.max['params']):
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    target = train['accuracy_group']
+    train = train.drop(['accuracy_group'], axis=1)
+    oof_pred = np.zeros((len(train)))
+    y_pred = np.zeros((len(test)))
+    print(max_param)
+    for fold, (tr_ind, val_ind) in enumerate(kf.split(train, target)):
+        print('Fold {}'.format(fold + 1))
+        x_train, x_val = train.loc[tr_ind], train.loc[val_ind]
+        y_train, y_val = target.loc[tr_ind], target.loc[val_ind]
+        train_set = lgb.Dataset(x_train, y_train, categorical_feature=categoricals)
+        val_set = lgb.Dataset(x_val, y_val, categorical_feature=categoricals)
+
+        params = {
+            'n_estimators':int(max_param['n_estimators']),
+            'boosting_type': 'gbdt',
+            'objective': 'regression',
+            'metric': 'rmse',
+            'subsample': max_param['subsample'],
+            'subsample_freq': 1,
+            'learning_rate': max_param['learning_rate'],
+            'feature_fraction': max_param['feature_fraction'],
+            'lambda_l1': 1,
+            'lambda_l2': 1,
+            'early_stopping_rounds': 100,
+            'verbose': -1
+            }
+
+        model = lgb.train(params, train_set, early_stopping_rounds = 50, valid_sets=[train_set, val_set], verbose_eval=1000)
+        oof_pred[val_ind] = model.predict(x_val)
+        print('Partial score of fold {} is: {}'.format(fold, cohen_kappa_score(y_val, np.round(oof_pred[val_ind]))))
+        y_pred += model.predict(test) / 5
+    loss_score = cohen_kappa_score(target, np.round(oof_pred), weights='quadratic')#trainのロス
+    result = pd.Series(np.argmax(oof_pred))
+    print('Our oof cohen kappa score is: ', loss_score)
+    print(result.value_counts(normalize = True))
+    return model, y_pred
+#%%
+model, prediction = final_run_lgb(train, test)
+#%%
+importance = pd.DataFrame(model.feature_importance(), index=test.columns, columns=['importance']).sort_values('importance', ascending=False)
+display(importance)
+#%%
+#クラスタリングでもいいかも
+sub = pd.read_csv(f'{path}sample_submission.csv')
+sub['accuracy_group'] = np.round(prediction).astype(int)
+sub = sub.drop('(num_incorrect+1)*num_correct', axis=1)
+sub.to_csv('submission.csv', index = False)
+display(sub['accuracy_group'].value_counts())
+print(sub.dtypes)
+print('done!')
 
 # %%
