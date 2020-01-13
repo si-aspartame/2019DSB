@@ -22,13 +22,12 @@ from DSB_func_ishikawa import *
 import warnings
 warnings.filterwarnings('ignore')
 
-
+#カテゴリカルの指定とか
 # %%
 path = './input/'
 print('Loading...')
 train = pd.read_csv(f'{path}train.csv')
 test = pd.read_csv(f'{path}test.csv')
-labels = pd.read_csv(f'{path}train_labels.csv')
 
 #%%
 # train_df[(train_df['event_code']==4100) & (train_df['type'] == 'Assessment')]
@@ -44,7 +43,9 @@ print(dropping_in_data)
 print(dropping_in_labels)
 
 #%%
-train, test = transform(train, test)
+train = transform(train)
+title_encoder = LabelEncoder().fit(train['title'])
+train['title'] = title_encoder.transform(train['title'])
 
 #%%
 train = data_squeeze(train,mode='train')
@@ -57,11 +58,12 @@ labels = labels.drop(columns=dropping_in_labels, axis=1)
 #%%
 train = pd.merge(train, labels, on='game_session|installation_id')
 train = train.drop(columns=dropping_in_data, axis=1)
-del labels
+del labels, dropping_in_labels
 gc.collect()
 
 #%%
-
+test = transform(test)
+test['title'] = title_encoder.transform(test['title'])
 test = data_squeeze(test, mode='test')
 test = test.drop(columns=dropping_in_data, axis=1)
 
@@ -69,12 +71,6 @@ test = test.drop(columns=dropping_in_data, axis=1)
 train = reduce_mem_usage(train)
 test = reduce_mem_usage(test)
 
-#%%
-print(train.columns)
-print(test.columns)
-
-#%%
-train.head()
 #%%
 categoricals = ['title', 'hour', 'weekday', 'exp_assess', 'installation_id->hour.mean']
 def bo_run_lgb(n_estimators, subsample, learning_rate, feature_fraction, train=train, test=test):
@@ -113,6 +109,8 @@ def bo_run_lgb(n_estimators, subsample, learning_rate, feature_fraction, train=t
     result = pd.Series(np.argmax(oof_pred))
     #print('Our oof cohen kappa score is: ', loss_score)
     #print(result.value_counts(normalize = True))
+    del kf, target, train, oof_pred, y_pred, x_train, x_val, y_train, y_val, train_set, val_set, model, result
+    gc.collect()
     return -(loss_score)#model, y_pred
 
 #%%
@@ -125,8 +123,8 @@ pbounds = {
 optimizer = BayesianOptimization(f=bo_run_lgb, pbounds=pbounds)
 optimizer.maximize(init_points=1, n_iter=1)
 max_param = optimizer.max['params']
-del model, optimizer
-gc.collect
+del optimizer
+gc.collect()
 #%%
 def final_run_lgb(train=train, test=test, max_param=optimizer.max['params']):
     kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -168,17 +166,15 @@ def final_run_lgb(train=train, test=test, max_param=optimizer.max['params']):
     return model, y_pred
 #%%
 model, prediction = final_run_lgb(train, test)
-#%%
 importance = pd.DataFrame(model.feature_importance(), index=test.columns, columns=['importance']).sort_values('importance', ascending=False)
 display(importance)
+del train, test, model
 #%%
 #クラスタリングでもいいかも
 sub = pd.read_csv(f'{path}sample_submission.csv')
-sub['accuracy_group'] = np.round(prediction).astype(int)
-sub = sub.drop('(num_incorrect+1)*num_correct', axis=1)
+sub['accuracy_group'] = np.round(prediction)
 sub.to_csv('submission.csv', index = False)
 display(sub['accuracy_group'].value_counts())
+sub['accuracy_group'].hist(log=True)
 print(sub.dtypes)
 print('done!')
-
-# %%
