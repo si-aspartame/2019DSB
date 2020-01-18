@@ -255,6 +255,7 @@ train = pd.merge(train, labels, on='game_session|installation_id')
 train = train.drop(columns=dropping_in_data, axis=1)
 del labels, dropping_in_labels
 gc.collect()
+
 #%%
 test = transform(test)
 test['title'] = title_encoder.transform(test['title'])
